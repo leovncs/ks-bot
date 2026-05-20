@@ -1,0 +1,14 @@
+# Discord
+discord.py>=2.3.0
+
+# Environment
+python-dotenv>=1.0.0
+
+# HTTP (image download)
+aiohttp>=3.9.0
+
+# OCR
+pytesseract>=0.3.10
+opencv-python-headless>=4.8.0
+Pillow>=10.0.0
+numpy>=1.24.0
