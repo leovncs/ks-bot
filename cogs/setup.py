@@ -79,15 +79,24 @@ class SetupCog(commands.Cog, name="Setup"):
         """Set this channel as the #my-schedule lookup channel (hidden by default)."""
         await self._configure(ctx, "lookup")
 
-        # Immediately hide from @everyone
         everyone = ctx.guild.default_role
         await ctx.channel.set_permissions(
             everyone, view_channel=False, send_messages=False
         )
+
+        user_role = discord.utils.get(ctx.guild.roles, name="USER")
+        if user_role:
+            await ctx.channel.set_permissions(
+                user_role, view_channel=False, send_messages=False
+            )
+            role_msg = "and hidden from the **USER** role"
+        else:
+            role_msg = "⚠️ (Warning: **USER** role not found in this server)"
+
         database.set_lookup_open(False)
         await ctx.send(
-            "🔒 This channel is now **hidden** from members.\n"
-            "It will become visible automatically when you run `!schedule publish`."
+            f"🔒 This channel is now **hidden** from everyone {role_msg}.\n"
+            "It will become visible to the USER role automatically when you run `!schedule publish`."
         )
 
     @setup.command(name="status")

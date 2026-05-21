@@ -432,17 +432,23 @@ class AdminCog(commands.Cog, name="Admin"):
         return [key] if key else None
 
     async def _set_lookup_visible(self, guild: discord.Guild, visible: bool) -> bool:
-        """Show or hide #my-schedule for @everyone. Returns True on success."""
+        """Show or hide #my-schedule for the USER role. Returns True on success."""
         ch_id = database.get_channel("lookup")
         if not ch_id or not (ch := guild.get_channel(ch_id)):
             return False
-        everyone = guild.default_role
+        
+        user_role = discord.utils.get(guild.roles, name="USER")
+        if not user_role:
+            logger.error("Could not change visibility: 'USER' role not found.")
+            return False
+
         if visible:
             await ch.set_permissions(
-                everyone, view_channel=True, send_messages=True, read_message_history=True
+                user_role, view_channel=True, send_messages=True, read_message_history=True
             )
         else:
-            await ch.set_permissions(everyone, view_channel=False, send_messages=False)
+            await ch.set_permissions(user_role, view_channel=False, send_messages=False)
+            
         database.set_lookup_open(visible)
         return True
 

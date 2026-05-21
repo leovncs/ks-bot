@@ -76,7 +76,7 @@ SPEEDUP_TYPES: list[str] = [
 ]
 
 SPEEDUP_LABELS: dict[str, str] = {
-    "general":      "⚡ General",
+    "general":      "⏩ General",
     "training":     "⚔️  Troops Training",
     "construction": "🏗️  Construction",
     "research":     "🔬 Research",
