@@ -1,16 +1,19 @@
 """
 cogs/submissions.py  -  Member signup flow.
 
-Members send a message in #submissions that must contain:
-  • A mention of the bot (@Bot)  OR  an attached speedup screenshot
-  • Their availability in natural language
+Members send a message in #submissions that must include either:
+  • A bot mention (@Bot) + availability text
+  • An attached speedup screenshot
+  • OR both (screenshot + text)
 
-The bot reads the screenshot via OCR, parses the availability message,
-and saves both to the database.
+Speedups can also be provided as plain text lines instead of (or in addition to)
+a screenshot:
+    General: 39d13h26m
+    Soldier: 949h26m
+    Construction: 56,966min
+    Research: 39:13:26
 
-Commands
---------
-(none — all interaction happens via on_message)
+All formats are converted to the canonical 'XdYhZm' representation.
 """
 
 import discord
@@ -37,7 +40,6 @@ class SubmissionsCog(commands.Cog, name="Submissions"):
         if message.author.bot:
             return
 
-        # Only act in the configured submissions channel
         ch_id = database.get_channel("submissions")
         if not ch_id or message.channel.id != ch_id:
             return
@@ -47,29 +49,42 @@ class SubmissionsCog(commands.Cog, name="Submissions"):
             a.content_type and a.content_type.startswith("image/")
             for a in message.attachments
         )
+        has_text_speedups = bool(ocr.extract_speedups_from_text(message.content))
 
-        if not bot_mentioned and not has_image:
+        if not bot_mentioned and not has_image and not has_text_speedups:
             return
 
         if not database.is_accepting():
             await message.reply(
                 "⛔ **Submissions are closed.**\n"
                 "The registration period has ended. "
-                "The schedule is being generated — stay tuned for the announcement!",
+                "The schedule will be announced soon!",
                 mention_author=False,
             )
             return
 
-        await self._process(message)
+        await self._process(message, user=message.author)
 
     # ── Core processing ───────────────────────────────────────────────────────
 
-    async def _process(self, message: discord.Message) -> None:
-        user   = message.author
+    async def _process(
+        self,
+        message: discord.Message,
+        user: discord.Member | discord.User,
+        override_username: str | None = None,
+        override_user_id: int | None = None,
+    ) -> None:
+        """
+        Process a submission.  When called from admin !users add, `override_*`
+        are set to the target user's identity.
+        """
+        username = override_username or user.display_name
+        user_id  = override_user_id  or user.id
+
         status = await message.reply("⏳ Processing your submission…", mention_author=False)
 
         try:
-            # 1. OCR — extract speedups from the first attached image
+            # 1. OCR — extract speedups from attached screenshot
             speedups    = {}
             image_found = False
 
@@ -79,16 +94,23 @@ class SubmissionsCog(commands.Cog, name="Submissions"):
                     raw = await ocr.download_image(attachment.url)
                     if raw:
                         speedups = await ocr.extract_speedups_from_image(raw)
-                        logger.info(f"OCR: {len(speedups)} speedup(s) from {user.name}")
-                    break  # process only the first image
+                        logger.info(f"OCR: {len(speedups)} speedup(s) read for {username}")
+                    break
 
-            # 2. Parse availability from the message text
+            # 2. Text speedups — override or supplement OCR values
+            text_speedups = ocr.extract_speedups_from_text(message.content)
+            if text_speedups:
+                # Text takes priority over OCR for any key it provides
+                speedups.update(text_speedups)
+                logger.info(f"Text speedups: {len(text_speedups)} value(s) for {username}")
+
+            # 3. Parse availability
             availability = parser.parse_availability(message.content)
 
             if not availability:
                 await status.edit(content=(
                     "❌ **Couldn't understand your availability.**\n"
-                    "Please include the days and time windows you're free. Examples:\n"
+                    "Please include the days and time windows. Examples:\n"
                     "```\n"
                     "@Bot Day 1: 10:00-16:00  Day 2: any time  Day 4: 21:00-23:00\n"
                     "@Bot Sign me up any time close to reset on all 3 days\n"
@@ -97,45 +119,45 @@ class SubmissionsCog(commands.Cog, name="Submissions"):
                 ))
                 return
 
-            # 3. Persist
+            # 4. Persist
             database.save_submission(
-                user_id=user.id,
-                username=user.display_name,
+                user_id=user_id,
+                username=username,
                 speedups=speedups,
                 availability=availability,
             )
 
-            # 4. Confirmation embed
+            # 5. Confirmation embed
             embed = discord.Embed(
                 title="✅ Submission Received!",
                 color=discord.Color.green(),
             )
-            embed.set_author(name=user.display_name, icon_url=user.display_avatar.url)
+            embed.set_author(name=username, icon_url=user.display_avatar.url)
             embed.add_field(
                 name="📅 Availability",
                 value=parser.format_availability(availability),
                 inline=False,
             )
             embed.add_field(
-                name="⚡ Speedups Detected",
-                value=ocr.format_speedups(speedups) if speedups else "_No speedups detected._",
+                name="⚡ Speedups",
+                value=ocr.format_speedups(speedups) if speedups else "_No speedups provided._",
                 inline=False,
             )
 
             warnings = []
-            if not image_found:
-                warnings.append("No screenshot attached — speedups were not recorded.")
-            elif not speedups:
-                warnings.append("OCR couldn't read the speedups. Make sure the image is legible.")
+            if not image_found and not text_speedups:
+                warnings.append("No screenshot or text speedups provided — speedups were not recorded.")
+            elif image_found and not speedups:
+                warnings.append("OCR couldn't read the screenshot. Check the image is legible.")
             if warnings:
                 embed.add_field(name="⚠️ Note", value="\n".join(warnings), inline=False)
 
             embed.set_footer(text="You'll be considered when the schedule is generated.")
             await status.edit(content=None, embed=embed)
-            logger.info(f"Submission saved: {user.name} (ID: {user.id})")
+            logger.info(f"Submission saved: {username} (ID: {user_id})")
 
         except Exception as exc:
-            logger.error(f"Submission error for {user.name}: {exc}", exc_info=True)
+            logger.error(f"Submission error for {username}: {exc}", exc_info=True)
             await status.edit(content=(
                 f"❌ **An unexpected error occurred:** `{exc}`\n"
                 "Please try again or contact an administrator."

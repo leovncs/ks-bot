@@ -18,6 +18,7 @@ Schedule management
 
 User management
   !users list          - list all registered users
+  !users add           - manually register a member by @name
   !users remove @user  - remove a user's submission
 
 Danger zone
@@ -31,6 +32,8 @@ import discord
 from discord.ext import commands
 
 import database
+import ocr
+import parser
 import scheduler
 from config import DAY_ALIASES, DAY_KEYS, DAY_LABELS, DAY_COLORS
 
@@ -293,8 +296,152 @@ class AdminCog(commands.Cog, name="Admin"):
     @commands.group(name="users", invoke_without_command=True)
     @_admin_check()
     async def users(self, ctx: commands.Context) -> None:
-        """Manage registered users. Usage: !users <list|remove>"""
-        await ctx.send("Usage: `!users list` or `!users remove @member`")
+        """Manage registered users. Usage: !users <list|add|remove>"""
+        await ctx.send(
+            "**User commands:**\n"
+            "`!users list`              \u2013 list all registered members\n"
+            "`!users add`               \u2013 manually register a member (see below)\n"
+            "`!users remove @member`    \u2013 remove a member's submission\n\n"
+            "**How to use `!users add`:**\n"
+            "Start with a mention to identify the target, then their availability and speedups:\n"
+            "```\n"
+            "!users add @Alice Day 1: 10:00-16:00  Day 4: any time\n"
+            "General: 39d13h26m\n"
+            "Soldier: 949h26m\n"
+            "Construction: 56,966min\n"
+            "```\n"
+            "You can use a Discord mention `@mention`, or just `@PlainName` for players "
+            "not in the server."
+        )
+
+    @users.command(name="add")
+    @_admin_check()
+    async def users_add(self, ctx: commands.Context, *, content: str = "") -> None:
+        """
+        Manually register a member.
+
+        The first word of `content` must be a mention:
+          @PlainName     - player not in the server (use display name as-is)
+          @DiscordMember - Discord mention (resolved to their display name)
+
+        The rest of the content follows the normal submission format.
+        You can also reply to an existing message; the replied message content
+        is merged with any content you write in the command message.
+        """
+        import re
+
+        # Merge command content with replied-to message content (if any)
+        full_content = content.strip()
+        ref_message: discord.Message | None = None
+
+        if ctx.message.reference:
+            try:
+                ref_message = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                full_content = (full_content + "\n" + ref_message.content).strip()
+            except discord.NotFound:
+                pass
+
+        if not full_content:
+            await ctx.send(
+                "❌ No content provided.\n"
+                "Usage: `!users add @Name Day 1: 10:00-16:00 ...`\n"
+                "Or reply to a member's message: `!users add @Name`"
+            )
+            return
+
+        # ── Resolve target identity ────────────────────────────────────────
+        username:  str | None = None
+        user_id:   int | None = None
+        avatar_url: str       = ctx.author.display_avatar.url
+
+        # Discord mention in the command message?
+        discord_mention = re.match(r"^<@!?(\d+)>", full_content)
+        if discord_mention:
+            uid    = int(discord_mention.group(1))
+            member = ctx.guild.get_member(uid) or next(
+                (m for m in ctx.message.mentions if m.id == uid), None
+            )
+            username   = member.display_name if member else f"User#{uid}"
+            user_id    = uid
+            avatar_url = member.display_avatar.url if member else ctx.author.display_avatar.url
+            full_content = full_content[discord_mention.end():].strip()
+
+        # Plain @Name mention?
+        elif plain_mention := re.match(r"^@(\S+)", full_content):
+            username     = plain_mention.group(1)
+            # Use a stable synthetic ID based on the username so it doesn't
+            # collide with real Discord IDs but is consistent across edits.
+            user_id      = abs(hash(username)) % (10 ** 15)
+            full_content = full_content[plain_mention.end():].strip()
+
+        if not username:
+            await ctx.send(
+                "❌ No target specified.\n"
+                "Start the content with `@Name` or a Discord `@mention`."
+            )
+            return
+
+        if not full_content:
+            await ctx.send(
+                f"❌ No availability or speedups found for **{username}**.\n"
+                "Add the schedule info after the mention."
+            )
+            return
+
+        # ── Parse availability and speedups ────────────────────────────────
+        availability = parser.parse_availability(full_content)
+        if not availability:
+            await ctx.send(
+                f"❌ Couldn't parse availability for **{username}**.\n"
+                "Make sure the message includes day and time info.\n"
+                "Example: `Day 1: 10:00-16:00  Day 4: any time`"
+            )
+            return
+
+        speedups = ocr.extract_speedups_from_text(full_content)
+
+        # Also try OCR on any images attached to the command message or the replied message
+        for source_msg in filter(None, [ctx.message, ref_message]):
+            for att in source_msg.attachments:
+                if att.content_type and att.content_type.startswith("image/"):
+                    raw = await ocr.download_image(att.url)
+                    if raw:
+                        ocr_speedups = await ocr.extract_speedups_from_image(raw)
+                        # Text values take priority; fill in any missing keys from OCR
+                        for k, v in ocr_speedups.items():
+                            speedups.setdefault(k, v)
+                    break
+
+        # ── Persist ────────────────────────────────────────────────────────
+        database.save_submission(
+            user_id=user_id,
+            username=username,
+            speedups=speedups,
+            availability=availability,
+        )
+
+        # ── Confirmation ───────────────────────────────────────────────────
+        embed = discord.Embed(
+            title=f"✅ Submission added for {username}",
+            color=discord.Color.green(),
+        )
+        embed.set_author(name=ctx.author.display_name, icon_url=avatar_url)
+        embed.add_field(
+            name="📅 Availability",
+            value=parser.format_availability(availability),
+            inline=False,
+        )
+        embed.add_field(
+            name="⚡ Speedups",
+            value=ocr.format_speedups(speedups) if speedups else "_No speedups provided._",
+            inline=False,
+        )
+        embed.set_footer(text=f"Added by {ctx.author.display_name}")
+        await ctx.send(embed=embed)
+        logger.info(
+            f"Admin {ctx.author.name} manually added {username!r} (id={user_id}) "
+            f"with {len(speedups)} speedup(s)"
+        )
 
     @users.command(name="list")
     @_admin_check()
@@ -341,18 +488,82 @@ class AdminCog(commands.Cog, name="Admin"):
 
     @users.command(name="remove")
     @_admin_check()
-    async def users_remove(self, ctx: commands.Context, member: discord.Member = None) -> None:
-        """Remove a member's submission. Usage: !users remove @member"""
-        if not member:
-            await ctx.send("❌ Please mention the member to remove. Example: `!users remove @Alice`")
+    async def users_remove(self, ctx: commands.Context, *, target: str = None) -> None:
+        """
+        Remove a member's submission.
+
+        Accepts any of:
+          !users remove @DiscordMention   - real server member
+          !users remove @PlainName        - non-server player added via !users add
+          !users remove PlainName         - same, without the @ sign
+        """
+        import re
+
+        if not target:
+            await ctx.send(
+                "❌ Please specify who to remove.\n"
+                "Examples:\n"
+                "`!users remove @Alice`\n"
+                "`!users remove @UnnamedUser`\n"
+                "`!users remove UnnamedUser`"
+            )
             return
 
-        removed = database.remove_submission(member.id)
+        target = target.strip()
+        subs   = database.get_all_submissions()
+
+        # ── Strategy 1: Discord mention  <@id> ───────────────────────────────
+        discord_mention = re.match(r"^<@!?(\d+)>$", target)
+        if discord_mention:
+            uid     = int(discord_mention.group(1))
+            removed = database.remove_submission(uid)
+            name    = ctx.guild.get_member(uid)
+            label   = name.display_name if name else f"User#{uid}"
+            if removed:
+                await ctx.send(f"✅ Submission from **{label}** removed.")
+                logger.info(f"{label} (id={uid}) removed by {ctx.author.name}")
+            else:
+                await ctx.send(f"❌ No submission found for **{label}**.")
+            return
+
+        # ── Strategy 2: plain @Name or Name — match by username string ───────
+        # Strip leading @ if present
+        name_query = target.lstrip("@").strip().lower()
+
+        matches = [
+            sub for sub in subs.values()
+            if sub["username"].lower() == name_query
+        ]
+
+        if not matches:
+            # Fuzzy fallback: partial match
+            matches = [
+                sub for sub in subs.values()
+                if name_query in sub["username"].lower()
+            ]
+
+        if not matches:
+            await ctx.send(
+                f"❌ No submission found matching **{target}**.\n"
+                f"Use `!users list` to see all registered names."
+            )
+            return
+
+        if len(matches) > 1:
+            names = ", ".join(f"**{s['username']}**" for s in matches)
+            await ctx.send(
+                f"⚠️ Multiple matches found: {names}\n"
+                f"Please be more specific or use their exact name."
+            )
+            return
+
+        sub     = matches[0]
+        removed = database.remove_submission(sub["user_id"])
         if removed:
-            await ctx.send(f"✅ Submission from **{member.display_name}** has been removed.")
-            logger.info(f"Submission of {member.name} removed by {ctx.author.name}")
+            await ctx.send(f"✅ Submission from **{sub['username']}** removed.")
+            logger.info(f"{sub['username']} (id={sub['user_id']}) removed by {ctx.author.name}")
         else:
-            await ctx.send(f"❌ **{member.display_name}** has no submission on record.")
+            await ctx.send(f"❌ Could not remove **{sub['username']}** — already gone?")
 
     # ════════════════════════════════════════════════════════════════════════
     # !reset
@@ -432,23 +643,17 @@ class AdminCog(commands.Cog, name="Admin"):
         return [key] if key else None
 
     async def _set_lookup_visible(self, guild: discord.Guild, visible: bool) -> bool:
-        """Show or hide #my-schedule for the USER role. Returns True on success."""
+        """Show or hide #my-schedule for @everyone. Returns True on success."""
         ch_id = database.get_channel("lookup")
         if not ch_id or not (ch := guild.get_channel(ch_id)):
             return False
-        
-        user_role = discord.utils.get(guild.roles, name="USER")
-        if not user_role:
-            logger.error("Could not change visibility: 'USER' role not found.")
-            return False
-
+        everyone = guild.default_role
         if visible:
             await ch.set_permissions(
-                user_role, view_channel=True, send_messages=True, read_message_history=True
+                everyone, view_channel=True, send_messages=True, read_message_history=True
             )
         else:
-            await ch.set_permissions(user_role, view_channel=False, send_messages=False)
-            
+            await ch.set_permissions(everyone, view_channel=False, send_messages=False)
         database.set_lookup_open(visible)
         return True
 

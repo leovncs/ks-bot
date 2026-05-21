@@ -284,6 +284,107 @@ async def download_image(url: str) -> Optional[bytes]:
     return None
 
 
+# ── Text-based speedup parsing ────────────────────────────────────────────────
+#
+# Accepts free-form lines like:
+#   General: 39d13h26m
+#   Soldier: 949h26m
+#   Construction: 56,966min
+#   Research: 39:13:26
+#   Learning: 56.966m
+
+_TEXT_SPEEDUP_ALIASES: dict[str, list[str]] = {
+    'general':      ['general', 'gen'],
+    'training':     ['soldier', 'troop', 'troops', 'training', 'soldier training'],
+    'construction': ['construction', 'const', 'build'],
+    'research':     ['research', 'res'],
+    'healing':      ['healing', 'heal'],
+    'learning':     ['learning', 'learn'],
+}
+
+_SPEEDUP_LINE_RE = re.compile(r'^([a-zA-Z][\w\s]{0,30}):\s*(.+)$', re.IGNORECASE)
+
+
+def parse_text_speedup_value(raw: str) -> Optional[str]:
+    """
+    Converts a free-form speedup value to the canonical 'XdYhZm' string.
+
+    Supported formats (all equivalent to 39d13h26m):
+      39d13h26m   39d13h   13h26m   39d
+      39:13:26    13:26
+      949h26m     949h
+      56966m      56966min
+      56,966min   56.966m   (thousands separators)
+    """
+    raw = raw.strip()
+
+    # Strip thousands separators: "56,966" → "56966",  "56.966" → "56966"
+    cleaned = re.sub(r'([0-9])[,.]([0-9]{3})(?!\d)', r'\1\2', raw)
+
+    total_min: Optional[int] = None
+
+    # Format 1: any combo of XdYhZm
+    m = re.fullmatch(r'(?:(\d+)d\s*)?(?:(\d+)h\s*)?(?:(\d+)m)?', cleaned, re.IGNORECASE)
+    if m and any(m.group(i) for i in (1, 2, 3)):
+        total_min = (
+            int(m.group(1) or 0) * 1440 +
+            int(m.group(2) or 0) * 60   +
+            int(m.group(3) or 0)
+        )
+
+    # Format 2: D:H:M  or  H:M
+    elif re.fullmatch(r'\d+:\d+:\d+', cleaned):
+        p = list(map(int, cleaned.split(':')))
+        total_min = p[0] * 1440 + p[1] * 60 + p[2]
+    elif re.fullmatch(r'\d+:\d+', cleaned):
+        p = list(map(int, cleaned.split(':')))
+        total_min = p[0] * 60 + p[1]
+
+    # Format 3: bare number + unit
+    elif m2 := re.fullmatch(r'(\d+)\s*(?:min(?:utes?)?|m)\b', cleaned, re.IGNORECASE):
+        total_min = int(m2.group(1))
+    elif m2 := re.fullmatch(r'(\d+)\s*h(?:ours?)?\b', cleaned, re.IGNORECASE):
+        total_min = int(m2.group(1)) * 60
+
+    if total_min is None:
+        return None
+
+    return _dhm(total_min)
+
+
+def _resolve_speedup_keyword(keyword: str) -> Optional[str]:
+    """Maps a free-form keyword to a canonical speedup type, or None."""
+    kw = keyword.strip().lower()
+    for stype, aliases in _TEXT_SPEEDUP_ALIASES.items():
+        if kw in aliases or any(kw.startswith(a) for a in aliases):
+            return stype
+    return None
+
+
+def extract_speedups_from_text(message: str) -> dict[str, str]:
+    """
+    Scans a message for lines matching 'Keyword: value' and returns
+    a speedup dict.  Ignores lines that don't resolve to a known type.
+
+    Example input:
+        General: 39d13h26m
+        Soldier: 949h26m
+        Construction: 56,966min
+    """
+    result: dict[str, str] = {}
+    for line in message.splitlines():
+        m = _SPEEDUP_LINE_RE.match(line.strip())
+        if not m:
+            continue
+        stype = _resolve_speedup_keyword(m.group(1))
+        if not stype:
+            continue
+        value = parse_text_speedup_value(m.group(2))
+        if value and value != '0m':
+            result[stype] = value
+    return result
+
+
 # ── Discord formatting ────────────────────────────────────────────────────────
 
 def format_speedups(speedups: dict) -> str:
